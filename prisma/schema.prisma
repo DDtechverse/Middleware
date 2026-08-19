@@ -1,0 +1,481 @@
+// ==============================================
+// RAYS DYNAMICS — Middleware Database Schema
+// PostgreSQL + Prisma
+// ==============================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------- Enums ----------------
+
+enum DeviceTier {
+  STANDARD   // local control only
+  PRO        // + global/remote control
+  ULTRA_PRO  // + energy monitoring, sensors, advanced features
+}
+
+enum ConnectionMode {
+  LOCAL
+  GLOBAL
+}
+
+enum DeviceStatus {
+  ONLINE
+  OFFLINE
+  CONNECTING
+  ERROR
+}
+
+enum MemberRole {
+  OWNER
+  ADMIN
+  MEMBER
+}
+
+enum AccessLevel {
+  CONTROL_ONLY      // can operate device/room but not manage/rename/remove
+  CONTROL_AND_MANAGE // can also rename, move, remove, edit
+}
+
+enum InviteStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+  REVOKED
+}
+
+enum ScheduleAction {
+  ON
+  OFF
+  OPEN
+  CLOSE
+}
+
+enum HomeType {
+  APARTMENT
+  VILLA
+  INDEPENDENT_HOUSE
+  OFFICE
+}
+
+// ---------------- Core: Users & Auth ----------------
+
+model User {
+  id            String   @id @default(uuid())
+  fullName      String
+  email         String   @unique
+  phone         String?  @unique
+  passwordHash  String
+  profilePhotoUrl String?
+  emailVerified Boolean  @default(false)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // preferences
+  language      String   @default("en")
+  theme         String   @default("light")   // light | dark | system
+  unitTemp      String   @default("C")        // C | F
+  unitEnergy    String   @default("kWh")      // kWh | Wh
+  notificationsEnabled Boolean @default(true)
+
+  ownedHomes    Home[]           @relation("HomeOwner")
+  homeMemberships HomeMember[]
+  invitesSent   Invite[]         @relation("InviteSender")
+  refreshTokens RefreshToken[]
+  sessions      Session[]
+  notifications Notification[]
+  voiceIntegrations VoiceIntegration[]
+
+  @@map("users")
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  token     String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  revoked   Boolean  @default(false)
+
+  @@map("refresh_tokens")
+}
+
+model Session {
+  id         String   @id @default(uuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deviceInfo String?
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+  lastActive DateTime @updatedAt
+
+  @@map("sessions")
+}
+
+model OtpVerification {
+  id        String   @id @default(uuid())
+  email     String
+  otpCode   String
+  purpose   String   // signup | forgot_password
+  expiresAt DateTime
+  verified  Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([email, purpose])
+  @@map("otp_verifications")
+}
+
+// ---------------- Home / Room Structure ----------------
+
+// NOTE: when a Home is created, the app layer must also insert a matching
+// HomeMember row for the owner (role: OWNER, fullHomeAccess: true) so that
+// permission checks can always query HomeMember uniformly instead of
+// special-casing Home.ownerId.
+model Home {
+  id        String   @id @default(uuid())
+  name      String
+  location  String?
+  type      HomeType @default(APARTMENT)
+  icon      String?
+  isPrimary Boolean  @default(false)
+
+  ownerId   String
+  owner     User     @relation("HomeOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+
+  rooms         Room[]
+  members       HomeMember[]
+  invites       Invite[]
+  scenes        Scene[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("homes")
+}
+
+model Room {
+  id        String   @id @default(uuid())
+  name      String
+  type      String   // Living Room, Bedroom, Kitchen, Study, Custom...
+  icon      String?
+
+  homeId    String
+  home      Home     @relation(fields: [homeId], references: [id], onDelete: Cascade)
+
+  devices       Device[]
+  roomAccess    RoomAccess[]
+  scenes        Scene[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("rooms")
+}
+
+// ---------------- Devices ----------------
+
+model DeviceType {
+  id          String   @id @default(uuid())
+  name        String   @unique   // Smart Switch, Smart Plug, Smart Fan, Smart AC Controller, etc.
+  category    String              // switch | plug | bulb | fan | ac | curtain | panel | sensor | camera | other
+  capabilities Json               // e.g. {"onOff":true,"brightness":true,"speedLevels":5}
+  createdAt   DateTime @default(now())
+
+  devices     Device[]
+
+  @@map("device_types")
+}
+
+model Device {
+  id            String       @id @default(uuid())
+  name          String
+  serialNumber  String       @unique   // hardware identity / MAC
+  firmwareVersion String?
+
+  deviceTypeId  String
+  deviceType    DeviceType   @relation(fields: [deviceTypeId], references: [id])
+
+  roomId        String
+  room          Room         @relation(fields: [roomId], references: [id], onDelete: Cascade)
+
+  tier          DeviceTier   @default(STANDARD)
+  status        DeviceStatus @default(OFFLINE)
+  connectionMode ConnectionMode @default(LOCAL)
+
+  localIp       String?      // for local REST/WebSocket when on same wifi
+  globalDeviceId String?     @unique  // identifier used by middleware for global routing
+  deviceSecretHash String?   // bcrypt hash of the secret the physical board generates at first boot;
+                             // used to authenticate its /ws/device connection (device_id + device_secret handshake)
+
+  pairedAt      DateTime?
+  lastSeenAt    DateTime?
+
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  state         DeviceState?
+  relayChannels RelayChannelState[]
+  alertRules    ChannelAlertRule[]
+  schedules     Schedule[]
+  sceneActions  SceneAction[]
+  deviceAccess  DeviceAccess[]
+  energyLogs    EnergyLog[]
+
+  @@map("devices")
+}
+
+// Per-channel relay state for multi-gang smart switches (4CH/8CH boards).
+// One physical Device (one ESP32, one WS connection, one serialNumber) can
+// drive several independently-switched loads — this table tracks each one.
+model RelayChannelState {
+  id        String   @id @default(uuid())
+  deviceId  String
+  device    Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  channel   Int      // 0-indexed relay channel on the physical board
+  state     Boolean  @default(false)
+  name      String?  // user-assigned appliance name, e.g. "Ceiling Light" — shown on the
+                      // Home dashboard instead of the generic "Channel 0"
+  icon      String?  // icon key chosen by the user (e.g. "light","fan","ac","plug","curtain","other")
+  updatedAt DateTime @updatedAt
+
+  @@unique([deviceId, channel])
+  @@map("relay_channel_states")
+}
+
+// current live state (separate from historical logs)
+model DeviceState {
+  id          String   @id @default(uuid())
+  deviceId    String   @unique
+  device      Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  isOn        Boolean  @default(false)
+  brightness  Int?     // 0-100, for lights
+  fanSpeed    Int?     // 1-5
+  temperature Float?   // AC set temp
+  mode        String?  // Cool/Auto/Swing/etc for AC
+  powerWatts  Float?   // live power draw (Ultra Pro plugs)
+  energyToday Float?   // kWh accumulated today (Ultra Pro)
+
+  updatedAt   DateTime @updatedAt
+
+  @@map("device_states")
+}
+
+// historical energy readings (Ultra Pro tier only) — for future Energy module
+model EnergyLog {
+  id         String   @id @default(uuid())
+  deviceId   String
+  device     Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  powerWatts Float
+  energyKwh  Float
+  recordedAt DateTime @default(now())
+
+  @@index([deviceId, recordedAt])
+  @@map("energy_logs")
+}
+
+// ---------------- Schedules ----------------
+
+model Schedule {
+  id          String         @id @default(uuid())
+  deviceId    String
+  device      Device         @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  channel     Int            @default(0) // which relay channel on that device this schedule targets
+
+  action      ScheduleAction
+  time        String         // "19:30" 24hr format
+  repeatDays  String[]       // ["MON","TUE",...] empty = one-time
+  isOneTime   Boolean        @default(false)
+
+  notifyOnRun Boolean        @default(true)
+  enabled     Boolean        @default(true)
+
+  createdBy   String         // userId
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  @@map("schedules")
+}
+
+// ---------------- Scenes ----------------
+
+model Scene {
+  id        String   @id @default(uuid())
+  name      String
+  icon      String?
+
+  homeId    String
+  home      Home     @relation(fields: [homeId], references: [id], onDelete: Cascade)
+
+  roomId    String
+  room      Room     @relation(fields: [roomId], references: [id], onDelete: Cascade)
+
+  actions   SceneAction[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("scenes")
+}
+
+model SceneAction {
+  id        String         @id @default(uuid())
+  sceneId   String
+  scene     Scene          @relation(fields: [sceneId], references: [id], onDelete: Cascade)
+
+  deviceId  String
+  device    Device         @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  channel   Int            @default(0) // which relay channel on that device this action targets
+
+  action    ScheduleAction
+  brightness Int?
+  fanSpeed  Int?
+  temperature Float?
+
+  @@map("scene_actions")
+}
+
+// ---------------- Sharing & Permissions (Home > Room > Device) ----------------
+
+// Home-level membership: base role a user has on a home
+model HomeMember {
+  id        String     @id @default(uuid())
+  homeId    String
+  home      Home       @relation(fields: [homeId], references: [id], onDelete: Cascade)
+
+  userId    String
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  role      MemberRole @default(MEMBER)
+  accessLevel AccessLevel @default(CONTROL_ONLY)
+
+  // if true, member has access to ALL rooms/devices in this home
+  // if false, access is restricted to explicit RoomAccess / DeviceAccess rows below
+  fullHomeAccess Boolean @default(true)
+
+  joinedAt  DateTime   @default(now())
+
+  roomAccess   RoomAccess[]
+  deviceAccess DeviceAccess[]
+
+  @@unique([homeId, userId])
+  @@map("home_members")
+}
+
+// Room-level override — only used when fullHomeAccess = false
+model RoomAccess {
+  id            String     @id @default(uuid())
+  homeMemberId  String
+  homeMember    HomeMember @relation(fields: [homeMemberId], references: [id], onDelete: Cascade)
+
+  roomId        String
+  room          Room       @relation(fields: [roomId], references: [id], onDelete: Cascade)
+
+  accessLevel   AccessLevel @default(CONTROL_ONLY)
+
+  @@unique([homeMemberId, roomId])
+  @@map("room_access")
+}
+
+// Device-level override — most granular; used when a member needs access
+// to a single device without full room/home access (e.g. one shared smart plug)
+model DeviceAccess {
+  id            String     @id @default(uuid())
+  homeMemberId  String
+  homeMember    HomeMember @relation(fields: [homeMemberId], references: [id], onDelete: Cascade)
+
+  deviceId      String
+  device        Device     @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  accessLevel   AccessLevel @default(CONTROL_ONLY)
+
+  @@unique([homeMemberId, deviceId])
+  @@map("device_access")
+}
+
+// ---------------- Notifications ----------------
+
+model Notification {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  title     String
+  body      String
+  category  String   // device_status | system_update | schedule_run | sharing | general
+  read      Boolean  @default(false)
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, read])
+  @@map("notifications")
+}
+
+// ---------------- Voice Assistant Integrations ----------------
+
+model VoiceIntegration {
+  id          String   @id @default(uuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  provider    String   // google_home | alexa
+  connected   Boolean  @default(false)
+  accessToken String?  // encrypted at rest, not stored plain in production
+  refreshToken String?
+  connectedAt DateTime?
+  lastSyncAt  DateTime?
+
+  @@unique([userId, provider])
+  @@map("voice_integrations")
+}
+
+// Per-channel "on for too long" alert — configured from the Smart Features
+// screen. A background job checks RelayChannelState.updatedAt against this
+// threshold and fires a Notification once per ON period (not spammed every
+// check) using lastAlertedAt as a guard.
+model ChannelAlertRule {
+  id            String   @id @default(uuid())
+  deviceId      String
+  device        Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  channel       Int
+
+  thresholdHours Float   // e.g. 2.5 hours
+  enabled       Boolean  @default(true)
+  lastAlertedAt DateTime?
+
+  createdBy     String   // userId
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([deviceId, channel])
+  @@map("channel_alert_rules")
+}
+model Invite {
+  id          String       @id @default(uuid())
+  homeId      String
+  home        Home         @relation(fields: [homeId], references: [id], onDelete: Cascade)
+
+  invitedEmail String
+  invitedBy    String
+  sender       User         @relation("InviteSender", fields: [invitedBy], references: [id])
+
+  role         MemberRole   @default(MEMBER)
+  accessLevel  AccessLevel  @default(CONTROL_ONLY)
+  fullHomeAccess Boolean    @default(true)
+  // optional scoped access proposed at invite time (room/device ids), applied on accept
+  scopedRoomIds   String[]
+  scopedDeviceIds String[]
+
+  status       InviteStatus @default(PENDING)
+  createdAt    DateTime     @default(now())
+  respondedAt  DateTime?
+
+  @@map("invites")
+}

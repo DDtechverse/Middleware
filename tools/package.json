@@ -1,0 +1,9 @@
+{
+  "name": "rays-device-simulator",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "ws": "^8.18.0",
+    "node-fetch": "^2.7.0"
+  }
+}
