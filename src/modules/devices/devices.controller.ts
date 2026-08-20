@@ -33,12 +33,32 @@ export const getDevice = asyncHandler(async (req: Request, res: Response) => {
   return ok(res, device);
 });
 
-// --- App-driven pairing flow (real production path, used once the app exists) ---
-const pairingSessions = new Map<string, { roomId: string; userId: string; createdAt: number }>();
+// --- App-driven pairing flow (real production path) ---
+// The session stores what the user picked in "Add Device" (name/type/tier)
+// BEFORE the physical provisioning happens, so whichever side completes the
+// pairing (app itself for Standard, or the device calling /claim for
+// Pro/Ultra) has everything needed to create the Device row correctly.
+interface PairingSession {
+  roomId: string;
+  userId: string;
+  createdAt: number;
+  name?: string;
+  deviceTypeId?: string;
+  tier?: string;
+  claimedDeviceId?: string;
+}
+const pairingSessions = new Map<string, PairingSession>();
+
+const startPairingSchema = z.object({
+  name: z.string().optional(),
+  deviceTypeId: z.string().optional(),
+  tier: z.enum(["STANDARD", "PRO", "ULTRA_PRO"]).optional(),
+});
 
 export const startPairing = asyncHandler(async (req: Request, res: Response) => {
+  const input = startPairingSchema.parse(req.body || {});
   const pairingSessionId = uuid();
-  pairingSessions.set(pairingSessionId, { roomId: req.params.roomId, userId: req.userId!, createdAt: Date.now() });
+  pairingSessions.set(pairingSessionId, { roomId: req.params.roomId, userId: req.userId!, createdAt: Date.now(), ...input });
   return ok(res, { pairingSessionId });
 });
 
@@ -80,6 +100,23 @@ export const confirmPairing = asyncHandler(async (req: Request, res: Response) =
   pairingSessions.delete(req.params.pairingSessionId);
 
   return ok(res, { device }, 201);
+});
+
+// App polls this while waiting for a Pro/Ultra device to come online and
+// claim itself (see claimDevice below) — the device does the claiming, not
+// the app, so the app needs a way to find out when it's done.
+export const getPairingStatus = asyncHandler(async (req: Request, res: Response) => {
+  const session = pairingSessions.get(req.params.pairingSessionId);
+  if (!session) throw new ApiError(404, "PAIRING_SESSION_NOT_FOUND", "Pairing session expired or not found.");
+
+  if (session.claimedDeviceId) {
+    const device = await prisma.device.findUnique({
+      where: { id: session.claimedDeviceId },
+      include: { deviceType: true, state: true, relayChannels: true },
+    });
+    return ok(res, { claimed: true, device });
+  }
+  return ok(res, { claimed: false });
 });
 
 // --- Hardware bring-up / self-registration (what the firmware calls today) ---
@@ -133,6 +170,84 @@ export const registerDevice = asyncHandler(async (req: Request, res: Response) =
 
   console.log(`[Bring-up] Registered device ${input.device_id} -> ${device.id} in room ${roomId}`);
   return res.status(200).json({ ok: true, deviceId: device.id }); // plain 200 body — firmware only checks HTTP status code
+});
+
+// PUBLIC — this is the real production pairing path for Pro/Ultra devices.
+// The device calls this itself once it's online, using the claim_token
+// (pairingSessionId) it received during /provision. This replaces blind
+// self-registration with a flow that's actually tied to the room/user the
+// app's "Add Device" screen started a pairing session for.
+const claimSchema = z.object({
+  claim_token: z.string().min(1),
+  device_id: z.string().min(1),
+  device_secret: z.string().min(1),
+  firmware_version: z.string().optional(),
+  tier: z.enum(["STANDARD", "PRO", "ULTRA_PRO"]).default("PRO"),
+  relay_count: z.number().int().min(1).max(8).default(8),
+});
+
+export const claimDevice = asyncHandler(async (req: Request, res: Response) => {
+  const input = claimSchema.parse(req.body);
+
+  const session = pairingSessions.get(input.claim_token);
+  if (!session) throw new ApiError(404, "PAIRING_SESSION_NOT_FOUND", "This claim_token doesn't match any active pairing session.");
+
+  let deviceTypeId = session.deviceTypeId;
+  if (!deviceTypeId) {
+    let dt = await prisma.deviceType.findFirst({ where: { name: "Smart Switch" } });
+    if (!dt) {
+      dt = await prisma.deviceType.create({
+        data: { name: "Smart Switch", category: "switch", capabilities: { onOff: true, gangs: [4, 8] } },
+      });
+    }
+    deviceTypeId = dt.id;
+  }
+
+  const connectionMode = input.tier === "STANDARD" ? "LOCAL" : "GLOBAL";
+  const secretHash = await hashPassword(input.device_secret);
+
+  const device = await prisma.device.upsert({
+    where: { serialNumber: input.device_id },
+    update: { deviceSecretHash: secretHash, tier: input.tier, connectionMode, firmwareVersion: input.firmware_version, roomId: session.roomId },
+    create: {
+      name: session.name || `${input.tier} Switch ${input.relay_count}CH`,
+      serialNumber: input.device_id,
+      deviceTypeId,
+      roomId: session.roomId,
+      tier: input.tier,
+      connectionMode,
+      status: "OFFLINE",
+      firmwareVersion: input.firmware_version,
+      deviceSecretHash: secretHash,
+      pairedAt: new Date(),
+      globalDeviceId: connectionMode === "GLOBAL" ? uuid() : null,
+    },
+  });
+
+  await prisma.deviceState.upsert({
+    where: { deviceId: device.id },
+    update: {},
+    create: { deviceId: device.id, isOn: false },
+  });
+
+  // create any missing channel rows (harmless if they already exist from a re-claim)
+  for (let ch = 0; ch < input.relay_count; ch++) {
+    await prisma.relayChannelState.upsert({
+      where: { deviceId_channel: { deviceId: device.id, channel: ch } },
+      update: {},
+      create: { deviceId: device.id, channel: ch, state: false },
+    });
+  }
+
+  session.claimedDeviceId = device.id;
+
+  const room = await prisma.room.findUnique({ where: { id: session.roomId } });
+  if (room) {
+    broadcastToHomeSubscribers(room.homeId, { event: "device.paired", deviceId: device.id, roomId: session.roomId });
+  }
+
+  console.log(`[Claim] Device ${input.device_id} claimed pairing session ${input.claim_token} -> ${device.id}`);
+  return res.status(200).json({ ok: true, deviceId: device.id });
 });
 
 const renameSchema = z.object({ name: z.string().min(1).optional(), localIp: z.string().optional() });

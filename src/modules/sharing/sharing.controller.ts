@@ -4,6 +4,7 @@ import { prisma } from "../../config/db";
 import { ok, ApiError } from "../../utils/apiResponse";
 import { asyncHandler } from "../../utils/asyncHandler";
 import { sendToUser } from "../../websocket/app.gateway";
+import { broadcastToHomeSubscribers } from "../../websocket/app.gateway";
 
 export const listMembers = asyncHandler(async (req: Request, res: Response) => {
   const members = await prisma.homeMember.findMany({
@@ -122,6 +123,11 @@ export const acceptInvite = asyncHandler(async (req: Request, res: Response) => 
   }
 
   await prisma.invite.update({ where: { id: invite.id }, data: { status: "ACCEPTED", respondedAt: new Date() } });
+
+  // Let the inviter's Management -> Sharing tab refresh live instead of only
+  // updating after a manual pull-to-refresh.
+  broadcastToHomeSubscribers(invite.homeId, { event: "sharing.member_joined", homeId: invite.homeId });
+
   return ok(res, member);
 });
 

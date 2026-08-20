@@ -32,6 +32,43 @@ interface DeviceSocketMeta {
 const deviceSockets = new Map<WebSocket, DeviceSocketMeta>();
 const deviceIdToSocket = new Map<string, WebSocket>(); // Device.id -> ws
 
+// Firmware sends a heartbeat every 30s (HEARTBEAT_INTERVAL_MS in BuildConfig.h).
+// If a device's WiFi drops abruptly (power cut, router reboot, signal loss),
+// the underlying TCP connection often doesn't send a clean close — the `ws`
+// library's 'close' event may never fire, leaving a "zombie" connection that
+// looks ONLINE forever even though the device is actually gone. This sweep
+// catches that: any device that hasn't sent a heartbeat in 3x its expected
+// interval is declared OFFLINE and its stale socket is forcibly terminated.
+const HEARTBEAT_TIMEOUT_MS = 90 * 1000;
+
+function startStaleConnectionWatchdog() {
+  setInterval(async () => {
+    const staleDevices = await prisma.device.findMany({
+      where: {
+        status: "ONLINE",
+        connectionMode: "GLOBAL",
+        lastSeenAt: { lt: new Date(Date.now() - HEARTBEAT_TIMEOUT_MS) },
+      },
+    });
+
+    for (const device of staleDevices) {
+      console.log(`[Device WS] ${device.serialNumber} missed heartbeat — marking OFFLINE`);
+      await prisma.device.update({ where: { id: device.id }, data: { status: "OFFLINE" } }).catch(() => {});
+
+      const room = await prisma.room.findUnique({ where: { id: device.roomId } });
+      if (room) {
+        broadcastToHomeSubscribers(room.homeId, { event: "device.status_changed", deviceId: device.id, status: "OFFLINE" });
+      }
+
+      const ws = deviceIdToSocket.get(device.id);
+      if (ws) {
+        ws.terminate(); // force-close the zombie socket so a real reconnect isn't blocked
+        deviceIdToSocket.delete(device.id);
+      }
+    }
+  }, 30 * 1000); // sweep every 30s
+}
+
 // noServer: true — see the comment in app.gateway.ts for why. Routing happens
 // centrally in server.ts's single 'upgrade' listener.
 export const deviceWss = new WebSocketServer({ noServer: true });
@@ -146,6 +183,7 @@ export function initDeviceGateway() {
   });
 
   console.log("[WS] Device gateway ready on /ws/device (device_id/device_secret protocol)");
+  startStaleConnectionWatchdog();
 }
 
 /**

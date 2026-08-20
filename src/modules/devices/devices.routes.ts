@@ -13,11 +13,13 @@ const deviceRouter = Router();
 
 // PUBLIC — called directly by the physical board itself, before any user is involved.
 deviceRouter.post("/register", controller.registerDevice);
+deviceRouter.post("/claim", controller.claimDevice);
 
 // everything below requires a logged-in user
 deviceRouter.get("/types", authGuard, controller.listDeviceTypes);
 deviceRouter.post("/pair/:pairingSessionId/scan", authGuard, controller.scanForDevices);
 deviceRouter.post("/pair/:pairingSessionId/confirm", authGuard, controller.confirmPairing);
+deviceRouter.get("/pair/:pairingSessionId/status", authGuard, controller.getPairingStatus);
 deviceRouter.get("/:deviceId", authGuard, controller.getDevice);
 deviceRouter.patch("/:deviceId", authGuard, controller.renameDevice);
 deviceRouter.patch("/:deviceId/move", authGuard, controller.moveDevice);
