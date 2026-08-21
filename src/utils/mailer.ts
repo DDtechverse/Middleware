@@ -21,16 +21,24 @@ export async function sendOtpEmail(to: string, otp: string, purpose: "signup" | 
     return;
   }
 
-  const { error } = await resend.emails.send({
-    from: env.resend.from,
-    to,
-    subject,
-    html,
-  });
+  // Critical: this must never throw. A user's account is already created by
+  // the time this runs — if the SDK itself throws (bad API key, network
+  // blip, unverified sender domain, etc.) instead of returning a graceful
+  // {error} object, that exception must not be allowed to bubble up and
+  // fail the whole signup/login/forgot-password request. The OTP row still
+  // exists in the DB either way and can be resent.
+  try {
+    const { error } = await resend.emails.send({
+      from: env.resend.from,
+      to,
+      subject,
+      html,
+    });
 
-  if (error) {
-    console.error("[Resend] Failed to send email:", error);
-    // Don't throw — signup/login flows shouldn't hard-fail just because an
-    // email didn't go out; the OTP still exists in the DB and can be resent.
+    if (error) {
+      console.error("[Resend] Failed to send email:", error);
+    }
+  } catch (err) {
+    console.error("[Resend] Threw an exception while sending email:", err);
   }
 }
