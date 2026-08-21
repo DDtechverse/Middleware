@@ -168,6 +168,24 @@ export function initDeviceGateway() {
         });
 
         ws.send(JSON.stringify({ type: "relay_ack_received" }));
+
+        // This was the missing piece for real-time sync: without this
+        // broadcast, a relay command's result only ever showed up on
+        // whichever screen initiated it (via its own optimistic update) —
+        // any other open screen or session never found out the device
+        // actually confirmed the change.
+        const device = await prisma.device.findUnique({ where: { id: meta.deviceId } });
+        if (device) {
+          const room = await prisma.room.findUnique({ where: { id: device.roomId } });
+          if (room) {
+            broadcastToHomeSubscribers(room.homeId, {
+              event: "device.relay_changed",
+              deviceId: device.id,
+              channel,
+              state,
+            });
+          }
+        }
         return;
       }
     });

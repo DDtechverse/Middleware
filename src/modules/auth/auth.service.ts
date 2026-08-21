@@ -7,8 +7,13 @@ import { ApiError } from "../../utils/apiResponse";
 import { env } from "../../config/env";
 
 export async function signup(input: { fullName: string; email: string; phone?: string; password: string }) {
-  const existing = await prisma.user.findUnique({ where: { email: input.email } });
-  if (existing) throw new ApiError(409, "EMAIL_IN_USE", "An account with this email already exists.");
+  const existingEmail = await prisma.user.findUnique({ where: { email: input.email } });
+  if (existingEmail) throw new ApiError(409, "EMAIL_IN_USE", "An account with this email already exists.");
+
+  if (input.phone) {
+    const existingPhone = await prisma.user.findUnique({ where: { phone: input.phone } });
+    if (existingPhone) throw new ApiError(409, "PHONE_IN_USE", "An account with this mobile number already exists.");
+  }
 
   const passwordHash = await hashPassword(input.password);
   const user = await prisma.user.create({
