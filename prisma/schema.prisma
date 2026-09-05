@@ -463,8 +463,12 @@ model Invite {
   home        Home         @relation(fields: [homeId], references: [id], onDelete: Cascade)
 
   invitedEmail String
-  invitedBy    String
-  sender       User         @relation("InviteSender", fields: [invitedBy], references: [id])
+  invitedBy    String?
+  // SetNull (not the default RESTRICT) because the sender might be an Admin
+  // on someone ELSE's home, not the owner — deleting the sender's account
+  // shouldn't be blocked by, or delete, an invite that still belongs to a
+  // home someone else owns.
+  sender       User?        @relation("InviteSender", fields: [invitedBy], references: [id], onDelete: SetNull)
 
   role         MemberRole   @default(MEMBER)
   accessLevel  AccessLevel  @default(CONTROL_ONLY)
