@@ -73,6 +73,7 @@ const confirmPairingSchema = z.object({
   deviceTypeId: z.string(),
   serialNumber: z.string(),
   tier: z.enum(["STANDARD", "PRO", "ULTRA_PRO"]).default("STANDARD"),
+  relayCount: z.number().int().min(1).max(8).default(8),
 });
 
 export const confirmPairing = asyncHandler(async (req: Request, res: Response) => {
@@ -97,9 +98,23 @@ export const confirmPairing = asyncHandler(async (req: Request, res: Response) =
   });
 
   await prisma.deviceState.create({ data: { deviceId: device.id, isOn: false } });
+
+  // This was the actual bug: without these rows, the device exists (shows
+  // up in the Devices list) but has zero appliance tiles on the Dashboard
+  // and nothing to toggle in Device Detail — `relayChannels` was always
+  // empty for anything paired through this app-driven (Standard-tier) path.
+  for (let ch = 0; ch < input.relayCount; ch++) {
+    await prisma.relayChannelState.create({ data: { deviceId: device.id, channel: ch, state: false } });
+  }
+
   pairingSessions.delete(req.params.pairingSessionId);
 
-  return ok(res, { device }, 201);
+  const fullDevice = await prisma.device.findUnique({
+    where: { id: device.id },
+    include: { deviceType: true, state: true, relayChannels: true },
+  });
+
+  return ok(res, { device: fullDevice }, 201);
 });
 
 // App polls this while waiting for a Pro/Ultra device to come online and
